@@ -4680,6 +4680,244 @@ ${notes}
                 alertDiv.style.display = 'none';
             }, 5000);
         }
+        // ==================== نظام المزامنة الذكية مع Firebase ====================
+let pendingReservations = JSON.parse(localStorage.getItem('pendingReservations')) || [];
+
+// حفظ حجز محلياً عند عدم وجود نت
+function saveReservationLocally(reservationData) {
+    const localId = 'local_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+    const localReservation = {
+        id: localId,
+        ...reservationData,
+        createdAt: new Date().toISOString(),
+        synced: false
+    };
+    
+    pendingReservations.push(localReservation);
+    localStorage.setItem('pendingReservations', JSON.stringify(pendingReservations));
+    
+    // تخزين في localStorage كنسخة احتياطية رئيسية
+    const backupReservations = JSON.parse(localStorage.getItem('nakhilReservations_backup')) || [];
+    backupReservations.push(localReservation);
+    localStorage.setItem('nakhilReservations_backup', JSON.stringify(backupReservations));
+    
+    return localReservation;
+}
+
+// محاولة مزامنة الحجوزات المعلقة
+async function syncPendingReservations() {
+    if (pendingReservations.length === 0 || !navigator.onLine) return;
+    
+    showAlert('جاري مزامنة البيانات مع السحابة...', 'info');
+    
+    const syncedReservations = [];
+    const failedReservations = [];
+    
+    for (const localReservation of pendingReservations) {
+        try {
+            // تحضير بيانات الحجز للإرسال
+            const firestoreData = {
+                ...localReservation,
+                synced: true,
+                syncedAt: new Date().toISOString()
+            };
+            delete firestoreData.id; // نحذف الـ id المحلي
+        
+            // إرسال إلى Firebase
+            const docRef = await window.firebaseModules.addDoc(
+                window.firebaseModules.collection(window.firestore, 'reservations'),
+                firestoreData
+            );
+            
+            // تحديث النسخة الاحتياطية
+            const backupReservations = JSON.parse(localStorage.getItem('nakhilReservations_backup')) || [];
+            const updatedBackup = backupReservations.map(r => 
+                r.id === localReservation.id ? {...r, synced: true, firebaseId: docRef.id} : r
+            );
+            localStorage.setItem('nakhilReservations_backup', JSON.stringify(updatedBackup));
+            
+            syncedReservations.push(localReservation.id);
+            console.log('✅ تمت مزامنة حجز:', localReservation.id);
+            
+        } catch (error) {
+            console.error('❌ فشلت مزامنة حجز:', localReservation.id, error);
+            failedReservations.push(localReservation);
+        }
+    }
+    
+    // تحديث قائمة الحجوزات المعلقة
+    pendingReservations = pendingReservations.filter(r => !syncedReservations.includes(r.id));
+    localStorage.setItem('pendingReservations', JSON.stringify(pendingReservations));
+    
+    // إعادة تحميل الحجوزات من Firebase
+    if (syncedReservations.length > 0) {
+        await loadReservationsFromFirestore();
+    }
+    
+    if (syncedReservations.length > 0) {
+        showAlert(`✅ تمت مزامنة ${syncedReservations.length} حجز بنجاح`, 'success');
+    }
+    
+    if (failedReservations.length > 0) {
+        showAlert(`⚠️ فشلت مزامنة ${failedReservations.length} حجز - سيتم المحاولة لاحقاً`, 'warning');
+    }
+}
+
+// تعديل دالة saveReservationToFirestore لتعمل بدون إنترنت
+async function saveReservationToFirestore(reservationData) {
+    // التحقق من وجود اتصال
+    if (!navigator.onLine) {
+        // حفظ محلياً
+        const localReservation = saveReservationLocally(reservationData);
+        reservationCounter = Math.max(reservationCounter, parseInt(localReservation.reservationNumber) || 0);
+        
+        // إضافة إلى قائمة الحجوزات المحلية
+        const backupReservations = JSON.parse(localStorage.getItem('nakhilReservations_backup')) || [];
+        reservations = backupReservations;
+        
+        showAlert('⚠️ أنت غير متصل بالإنترنت. تم حفظ الحجز محلياً وسيتم مزامنته تلقائياً عند عودة الاتصال', 'warning');
+        
+        return {
+            success: true,
+            docId: localReservation.id,
+            reservationNumber: localReservation.reservationNumber,
+            data: localReservation,
+            offline: true
+        };
+    }
+    
+    // إذا كان هناك اتصال، نحفظ في Firebase كالمعتاد
+    try {
+        reservationCounter++;
+        const firestoreData = {
+            ...reservationData,
+            reservationNumber: reservationCounter,
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString()
+        };
+        
+        const docRef = await window.firebaseModules.addDoc(
+            window.firebaseModules.collection(window.firestore, 'reservations'),
+            firestoreData
+        );
+        
+        // حفظ نسخة احتياطية محلية
+        const backupReservations = JSON.parse(localStorage.getItem('nakhilReservations_backup')) || [];
+        backupReservations.push({
+            id: docRef.id,
+            ...firestoreData,
+            synced: true
+        });
+        localStorage.setItem('nakhilReservations_backup', JSON.stringify(backupReservations));
+        
+        return {
+            success: true,
+            docId: docRef.id,
+            reservationNumber: reservationCounter,
+            data: firestoreData
+        };
+        
+    } catch (error) {
+        console.error('❌ خطأ في الحفظ:', error);
+        // إذا فشل الاتصال رغم وجود نت، نحفظ محلياً
+        return saveReservationToFirestore(reservationData);
+    }
+}
+
+// مراقبة حالة الاتصال والمزامنة التلقائية
+window.addEventListener('online', function() {
+    console.log('✅ عودة الاتصال بالإنترنت - بدء المزامنة');
+    showAlert('تمت استعادة الاتصال، جاري مزامنة البيانات...', 'info');
+    syncPendingReservations();
+});
+
+// محاولة المزامنة عند تحميل الصفحة
+document.addEventListener('DOMContentLoaded', function() {
+    if (navigator.onLine && pendingReservations.length > 0) {
+        syncPendingReservations();
+    }
+});
+
+// تعديل دالة loadReservationsFromFirestore لدمج البيانات المحلية
+async function loadReservationsFromFirestore() {
+    try {
+        if (!navigator.onLine) {
+            // إذا كنا أوفلاين، نعرض البيانات المحلية فقط
+            const localData = JSON.parse(localStorage.getItem('nakhilReservations_backup')) || [];
+            reservations = localData.sort((a, b) => {
+                const dateA = a.eventDate ? new Date(a.eventDate) : new Date(0);
+                const dateB = b.eventDate ? new Date(b.eventDate) : new Date(0);
+                return dateB - dateA;
+            });
+            
+            reservationCounter = Math.max(...reservations.map(r => parseInt(r.reservationNumber) || 0), 0);
+            updateReservationsTable();
+            generateCalendar();
+            showAlert('أنت غير متصل - تعرض البيانات المحلية المحفوظة', 'info');
+            return;
+        }
+        
+        // إذا كنا أونلاين، نجلب من Firebase
+        showAlert('جاري تحميل الحجوزات من السحابة...', 'info');
+        
+        const reservationsCollection = window.firebaseModules.collection(window.firestore, 'reservations');
+        const q = window.firebaseModules.query(reservationsCollection, window.firebaseModules.orderBy('eventDate', 'desc'));
+        const querySnapshot = await window.firebaseModules.getDocs(q);
+        
+        const firebaseReservations = [];
+        querySnapshot.forEach((doc) => {
+            const data = doc.data();
+            firebaseReservations.push({
+                id: doc.id,
+                ...data,
+                synced: true
+            });
+        });
+        
+        // دمج مع البيانات المحلية غير المتزامنة
+        const localReservations = JSON.parse(localStorage.getItem('nakhilReservations_backup')) || [];
+        const unsyncedLocal = localReservations.filter(r => !r.synced);
+        
+        reservations = [...firebaseReservations, ...unsyncedLocal].sort((a, b) => {
+            const dateA = a.eventDate ? new Date(a.eventDate) : new Date(0);
+            const dateB = b.eventDate ? new Date(b.eventDate) : new Date(0);
+            return dateB - dateA;
+        });
+        
+        // حفظ النسخة المدمجة محلياً
+        localStorage.setItem('nakhilReservations_backup', JSON.stringify(reservations));
+        
+        // حساب أعلى رقم حجز
+        reservationCounter = Math.max(...reservations.map(r => parseInt(r.reservationNumber) || 0), 0);
+        
+        updateReservationsTable();
+        generateCalendar();
+        
+        if (unsyncedLocal.length > 0) {
+            showAlert(`تم تحميل ${firebaseReservations.length} حجز من السحابة + ${unsyncedLocal.length} حجز محلي غير متزامن`, 'info');
+            // محاولة مزامنة المحلية
+            syncPendingReservations();
+        } else {
+            showAlert(`تم تحميل ${reservations.length} حجز من السحابة`, 'success');
+        }
+        
+        setupRealtimeListener();
+        
+    } catch (error) {
+        console.error('❌ خطأ في تحميل الحجوزات:', error);
+        
+        // في حالة الخطأ، نعرض البيانات المحلية
+        const localData = JSON.parse(localStorage.getItem('nakhilReservations_backup')) || [];
+        reservations = localData;
+        if (reservations.length > 0) {
+            reservationCounter = Math.max(...reservations.map(r => parseInt(r.reservationNumber) || 0));
+            updateReservationsTable();
+            generateCalendar();
+            showAlert('خطأ في الاتصال بالسحابة - تعرض النسخة المحلية', 'error');
+        }
+    }
+}
     </script>
 </body>
+
 </html>
