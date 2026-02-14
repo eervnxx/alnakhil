@@ -1,8 +1,9 @@
-const CACHE_NAME = 'nakhil-cache-v1';
+const CACHE_NAME = 'nakhil-dynamic-v2';
 const urlsToCache = [
   '/h/',
   '/h/index.html',
   '/h/manifest.json',
+  '/h/offline.html',
   '/h/icons/icon-72x72.png',
   '/h/icons/icon-96x96.png',
   '/h/icons/icon-128x128.png',
@@ -20,22 +21,19 @@ const urlsToCache = [
   'https://www.gstatic.com/firebasejs/12.8.0/firebase-analytics.js'
 ];
 
-// تثبيت Service Worker وتخزين الملفات
+// تخزين الملفات الثابتة
 self.addEventListener('install', event => {
   event.waitUntil(
     caches.open(CACHE_NAME)
       .then(cache => {
-        console.log('✅ تم فتح الكاش وإضافة الملفات');
+        console.log('✅ تم تخزين الملفات الثابتة');
         return cache.addAll(urlsToCache);
-      })
-      .catch(error => {
-        console.error('❌ خطأ في التخزين المؤقت:', error);
       })
   );
   self.skipWaiting();
 });
 
-// تفعيل Service Worker وتنظيف الكاش القديم
+// تنظيف الكاش القديم
 self.addEventListener('activate', event => {
   event.waitUntil(
     caches.keys().then(cacheNames => {
@@ -52,122 +50,95 @@ self.addEventListener('activate', event => {
   self.clients.claim();
 });
 
-// استراتيجية الجلب: Network First ثم Cache
+// استراتيجية: Network First ثم Cache لطلبات API
 self.addEventListener('fetch', event => {
-  // تجاهل طلبات chrome-extension
-  if (event.request.url.startsWith('chrome-extension://')) {
-    return;
-  }
-
-  // تجاهل طلبات Firebase التي تحتاج اتصال مباشر
-  if (event.request.url.includes('firebase')) {
+  const url = new URL(event.request.url);
+  
+  // لطلبات Firebase API - نحاول الشبكة أولاً
+  if (url.hostname.includes('firebase') || url.pathname.includes('firestore')) {
     event.respondWith(
       fetch(event.request)
+        .then(response => {
+          return response;
+        })
         .catch(() => {
-          return caches.match(event.request);
+          // إذا فشلت الشبكة، نعيد رد فارغ مع إشارة أننا أوفلاين
+          return new Response(JSON.stringify({ offline: true }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' }
+          });
         })
     );
     return;
   }
 
+  // للملفات الثابتة - Cache First
   event.respondWith(
     caches.match(event.request)
-      .then(response => {
-        if (response) {
-          return response;
+      .then(cachedResponse => {
+        if (cachedResponse) {
+          return cachedResponse;
         }
-
         return fetch(event.request)
           .then(response => {
-            // التحقق من صحة الرد
-            if (!response || response.status !== 200 || response.type !== 'basic') {
-              return response;
-            }
-
-            // تخزين الملفات الجديدة في الكاش
-            const responseToCache = response.clone();
-            caches.open(CACHE_NAME)
-              .then(cache => {
-                cache.put(event.request, responseToCache);
+            // تخزين الملفات الجديدة
+            if (response.status === 200) {
+              const responseClone = response.clone();
+              caches.open(CACHE_NAME).then(cache => {
+                cache.put(event.request, responseClone);
               });
-
+            }
             return response;
           })
-          .catch(error => {
-            console.log('❌ فشل الجلب، استخدام الكاش:', event.request.url);
-            
-            // محاولة إرجاع صفحة الخطأ المخصصة إذا كانت متوفرة
+          .catch(() => {
+            // إذا كان طلب صفحة ولم نجدها في الكاش
             if (event.request.mode === 'navigate') {
               return caches.match('/h/offline.html');
             }
-            
-            return new Response('أنت غير متصل بالإنترنت', {
+            return new Response('لا يوجد اتصال بالإنترنت', {
               status: 503,
-              statusText: 'Service Unavailable',
-              headers: new Headers({
-                'Content-Type': 'text/plain; charset=utf-8'
-              })
+              statusText: 'Offline'
             });
           });
       })
   );
 });
 
-// التعامل مع الإشعارات الفورية (اختياري)
-self.addEventListener('push', event => {
-  const options = {
-    body: event.data.text(),
-    icon: '/h/icons/icon-192x192.png',
-    badge: '/h/icons/icon-72x72.png',
-    vibrate: [200, 100, 200],
-    dir: 'rtl',
-    lang: 'ar',
-    tag: 'nakhil-notification',
-    renotify: true,
-    requireInteraction: true,
-    actions: [
-      {
-        action: 'open',
-        title: 'فتح التطبيق'
-      },
-      {
-        action: 'close',
-        title: 'إغلاق'
-      }
-    ]
-  };
-
-  event.waitUntil(
-    self.registration.showNotification('قاعة النخيل للمناسبات', options)
-  );
-});
-
-// التعامل مع النقر على الإشعارات
-self.addEventListener('notificationclick', event => {
-  event.notification.close();
-
-  if (event.action === 'open') {
-    event.waitUntil(
-      clients.openWindow('/h/')
-    );
-  }
-});
-
-// تحديث دوري للكاش (كل 24 ساعة)
+// الاستماع لأحداث المزامنة الخلفية
 self.addEventListener('sync', event => {
-  if (event.tag === 'update-cache') {
-    event.waitUntil(updateCache());
+  if (event.tag === 'sync-reservations') {
+    event.waitUntil(syncReservations());
   }
 });
 
-async function updateCache() {
-  const cache = await caches.open(CACHE_NAME);
-  const requests = urlsToCache.map(url => new Request(url));
-  
+// مزامنة الحجوزات المخزنة محلياً مع Firebase
+async function syncReservations() {
   try {
-    await cache.addAll(requests);
-    console.log('✅ تم تحديث الكاش بنجاح');
+    const cache = await caches.open('pending-reservations');
+    const requests = await cache.keys();
+    
+    for (const request of requests) {
+      try {
+        const cachedResponse = await cache.match(request);
+        const reservationData = await cachedResponse.json();
+        
+        // محاولة إرسال الحجز إلى Firebase
+        const response = await fetch(request, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(reservationData)
+        });
+        
+        if (response.ok) {
+          // إذا نجح الإرسال، نحذف من الكاش المؤقت
+          await cache.delete(request);
+          console.log('✅ تم مزامنة حجز:', reservationData);
+        }
+      } catch (error) {
+        console.log('❌ فشل مزامنة حجز:', error);
+      }
+    }
   } catch (error) {
-    console.error('❌ فشل تحديث الكاش:', error);
+    console.log('❌ خطأ في المزامنة:', error);
   }
 }
